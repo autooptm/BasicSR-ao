@@ -294,7 +294,7 @@ class BasicVSRPlusPlus(nn.Module):
         self.cpu_cache = True if t > self.cpu_cache_length else False
 
         if self.is_low_res_input:
-            lqs_downsample = lqs.clone()
+            lqs_downsample = lqs
         else:
             lqs_downsample = F.interpolate(
                 lqs.view(-1, c, h, w), scale_factor=0.25, mode='bicubic').view(n, t, c, h // 4, w // 4)

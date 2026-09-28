@@ -1,0 +1,168 @@
+diff --git a/basicsr/archs/arch_util.py b/basicsr/archs/arch_util.py
+index 493e566112e85a2eb17d6b5aaf5241f4d0d882b7..9abd870cea730acf985d94dd89cdeb9023efa1c2 100644
+--- a/basicsr/archs/arch_util.py
++++ b/basicsr/archs/arch_util.py
+@@ -110,6 +110,9 @@ class Upsample(nn.Sequential):
+         super(Upsample, self).__init__(*m)
+ 
+ 
++_FLOW_WARP_GRID = {}
++
++
+ def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros', align_corners=True):
+     """Warp an image or feature map with optical flow.
+ 
+@@ -129,9 +132,13 @@ def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros', align_corne
+     assert x.size()[-2:] == flow.size()[1:3]
+     _, _, h, w = x.size()
+     # create mesh grid
+-    grid_y, grid_x = torch.meshgrid(torch.arange(0, h).type_as(x), torch.arange(0, w).type_as(x))
+-    grid = torch.stack((grid_x, grid_y), 2).float()  # W(x), H(y), 2
+-    grid.requires_grad = False
++    key = (h, w, x.dtype, x.device)
++    grid = _FLOW_WARP_GRID.get(key)
++    if grid is None:
++        grid_y, grid_x = torch.meshgrid(torch.arange(0, h).type_as(x), torch.arange(0, w).type_as(x))
++        grid = torch.stack((grid_x, grid_y), 2).float()  # W(x), H(y), 2
++        grid.requires_grad = False
++        _FLOW_WARP_GRID[key] = grid
+ 
+     vgrid = grid + flow
+     # scale grid to [-1,1]
+diff --git a/basicsr/archs/basicvsrpp_arch.py b/basicsr/archs/basicvsrpp_arch.py
+index 2a9952e4b441de0030d665a3db141774184f332f..6a3a446d51bc0a72ecd672d8d992b6fcc5a54ce4 100644
+--- a/basicsr/archs/basicvsrpp_arch.py
++++ b/basicsr/archs/basicvsrpp_arch.py
+@@ -294,7 +294,7 @@ class BasicVSRPlusPlus(nn.Module):
+         self.cpu_cache = True if t > self.cpu_cache_length else False
+ 
+         if self.is_low_res_input:
+-            lqs_downsample = lqs.clone()
++            lqs_downsample = lqs
+         else:
+             lqs_downsample = F.interpolate(
+                 lqs.view(-1, c, h, w), scale_factor=0.25, mode='bicubic').view(n, t, c, h // 4, w // 4)
+diff --git a/inference/inference_basicvsrpp.py b/inference/inference_basicvsrpp.py
+index b44aaa4829149c88248f4b1bf236ae440eb47a64..7f7d68faa861ac357e53da074acfc0558bc65961 100644
+--- a/inference/inference_basicvsrpp.py
++++ b/inference/inference_basicvsrpp.py
+@@ -1,4 +1,5 @@
+ import argparse
++import concurrent.futures
+ import cv2
+ import glob
+ import os
+@@ -10,15 +11,44 @@ from basicsr.data.data_util import read_img_seq
+ from basicsr.utils.img_util import tensor2img
+ 
+ 
+-def inference(imgs, imgnames, model, save_path):
++def opt_blocks():
++    from basicsr.archs.basicvsr_arch import ConvResidualBlocks
++    from basicsr.archs.basicvsrpp_arch import SecondOrderDeformableAlignment
++    from basicsr.archs.spynet_arch import BasicModule
++    ConvResidualBlocks.forward = torch.compile(ConvResidualBlocks.forward)
++    SecondOrderDeformableAlignment.forward = torch.compile(SecondOrderDeformableAlignment.forward)
++    BasicModule.forward = torch.compile(BasicModule.forward)
++
++
++def to_bgr_uint8(outputs):
++    x = outputs.squeeze(0).float().clamp_(0, 1).mul_(255.0).round_()
++    x = x.permute(0, 2, 3, 1).flip(-1)
++    return x.to(torch.uint8).contiguous().to('cpu', non_blocking=True)
++
++
++def inference(imgs, imgnames, model, save_path, args, pool, pending):
+     with torch.no_grad():
+-        outputs = model(imgs)
++        if args.opt_1:
++            with torch.autocast('cuda', dtype=torch.float16):
++                outputs = model(imgs)
++            outputs = outputs.float()
++        else:
++            outputs = model(imgs)
++
+     # save imgs
+-    outputs = outputs.squeeze()
+-    outputs = list(outputs)
+-    for output, imgname in zip(outputs, imgnames):
+-        output = tensor2img(output)
+-        cv2.imwrite(os.path.join(save_path, f'{imgname}_BasicVSRPP.png'), output)
++    if args.opt_3 and outputs.is_cuda:
++        host = to_bgr_uint8(outputs)
++        torch.cuda.synchronize()
++        frames = [host[i].numpy() for i in range(host.shape[0])]
++    else:
++        frames = [tensor2img(output) for output in list(outputs.squeeze(0))]
++
++    targets = [os.path.join(save_path, f'{imgname}_BasicVSRPP.png') for imgname in imgnames]
++    if pool is not None:
++        pending.extend(pool.submit(cv2.imwrite, p, f) for p, f in zip(targets, frames))
++    else:
++        for p, f in zip(targets, frames):
++            cv2.imwrite(p, f)
+ 
+ 
+ def main():
+@@ -28,9 +58,23 @@ def main():
+         '--input_path', type=str, default='datasets/REDS4/sharp_bicubic/000', help='input test image folder')
+     parser.add_argument('--save_path', type=str, default='results/BasicVSRPP/000', help='save image path')
+     parser.add_argument('--interval', type=int, default=100, help='interval size')
++    parser.add_argument('--no-opt-1', dest='opt_1', action='store_false', help='disable optimization 1')
++    parser.add_argument('--no-opt-2', dest='opt_2', action='store_false', help='disable optimization 2')
++    parser.add_argument('--no-opt-3', dest='opt_3', action='store_false',
++                        help='convert output frames on the CPU, as before')
++    parser.add_argument('--writers', type=int, default=16, help='PNG writers (0 = serial)')
++    parser.add_argument('--no-opt-4', dest='opt_4', action='store_false',
++                        help='disable optimization 4')
++    parser.set_defaults(opt_1=True, opt_2=True, opt_3=True, opt_4=True)
+     args = parser.parse_args()
+ 
+     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    if args.opt_4 and device.type == 'cuda':
++        torch.backends.cudnn.benchmark = True
++    if args.opt_1 and device.type != 'cuda':
++        args.opt_1 = False
++    if args.opt_2 and device.type == 'cuda':
++        opt_blocks()
+ 
+     # set up model
+     model = BasicVSRPlusPlus(mid_channels=64, num_blocks=7)
+@@ -53,16 +97,28 @@ def main():
+     # load data and inference
+     imgs_list = sorted(glob.glob(os.path.join(input_path, '*')))
+     num_imgs = len(imgs_list)
+-    if len(imgs_list) <= args.interval:  # too many images may cause CUDA out of memory
+-        imgs, imgnames = read_img_seq(imgs_list, return_imgname=True)
+-        imgs = imgs.unsqueeze(0).to(device)
+-        inference(imgs, imgnames, model, args.save_path)
+-    else:
+-        for idx in range(0, num_imgs, args.interval):
+-            interval = min(args.interval, num_imgs - idx)
+-            imgs, imgnames = read_img_seq(imgs_list[idx:idx + interval], return_imgname=True)
++    pool = (concurrent.futures.ThreadPoolExecutor(max_workers=args.writers)
++            if args.writers > 0 else None)
++    pending = []
++    try:
++        if len(imgs_list) <= args.interval:  # too many images may cause CUDA out of memory
++            imgs, imgnames = read_img_seq(imgs_list, return_imgname=True)
+             imgs = imgs.unsqueeze(0).to(device)
+-            inference(imgs, imgnames, model, args.save_path)
++            inference(imgs, imgnames, model, args.save_path, args, pool, pending)
++        else:
++            for idx in range(0, num_imgs, args.interval):
++                for fut in pending:
++                    fut.result()
++                pending.clear()
++                interval = min(args.interval, num_imgs - idx)
++                imgs, imgnames = read_img_seq(imgs_list[idx:idx + interval], return_imgname=True)
++                imgs = imgs.unsqueeze(0).to(device)
++                inference(imgs, imgnames, model, args.save_path, args, pool, pending)
++    finally:
++        for fut in pending:
++            fut.result()
++        if pool is not None:
++            pool.shutdown(wait=True)
+ 
+     # delete ffmpeg output images
+     if use_ffmpeg:

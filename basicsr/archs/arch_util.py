@@ -110,6 +110,9 @@ class Upsample(nn.Sequential):
         super(Upsample, self).__init__(*m)
 
 
+_FLOW_WARP_GRID = {}
+
+
 def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros', align_corners=True):
     """Warp an image or feature map with optical flow.
 
@@ -129,9 +132,13 @@ def flow_warp(x, flow, interp_mode='bilinear', padding_mode='zeros', align_corne
     assert x.size()[-2:] == flow.size()[1:3]
     _, _, h, w = x.size()
     # create mesh grid
-    grid_y, grid_x = torch.meshgrid(torch.arange(0, h).type_as(x), torch.arange(0, w).type_as(x))
-    grid = torch.stack((grid_x, grid_y), 2).float()  # W(x), H(y), 2
-    grid.requires_grad = False
+    key = (h, w, x.dtype, x.device)
+    grid = _FLOW_WARP_GRID.get(key)
+    if grid is None:
+        grid_y, grid_x = torch.meshgrid(torch.arange(0, h).type_as(x), torch.arange(0, w).type_as(x))
+        grid = torch.stack((grid_x, grid_y), 2).float()  # W(x), H(y), 2
+        grid.requires_grad = False
+        _FLOW_WARP_GRID[key] = grid
 
     vgrid = grid + flow
     # scale grid to [-1,1]

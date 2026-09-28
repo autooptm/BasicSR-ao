@@ -1,3 +1,65 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>BasicSR · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>4.90x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-4.90x-2ea44f"></a>
+    <a href="https://github.com/XPixelGroup/BasicSR/commit/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a"><img alt="base" src="https://img.shields.io/badge/upstream-8d56e3a045f9-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [XPixelGroup/BasicSR](https://github.com/XPixelGroup/BasicSR) at commit
+> [`8d56e3a045f9`](https://github.com/XPixelGroup/BasicSR/commit/8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python inference/inference_basicvsrpp.py` |
+| **Entry point** | `inference/inference_basicvsrpp.py` |
+| **Unit measured** | one 100-frame chunk (the default `--interval`) of a REDS clip: LR frames read → BasicVSR++ 4x video super-resolution → 100 1280x720 PNGs written to disk; measured over 12 REDS clips (1,200 frames) in one process |
+| **Before (stock)** | 12,214 ms per unit (145.5 s for the timed chunk loop) |
+| **After (this tree, all switches default ON)** | 2,473 ms per unit (29.7 s for the timed chunk loop; a one-time warm-up of ~30 s on the first chunk, 14 s for stock, is not included) |
+| **Speedup** | **4.90x** end to end on RTX 4090, noise floor of the host 1.5% |
+| **Output** | the written PNGs match the stock program's to within 1 grey level on 99.9% of pixels, PSNR 61.9 dB against it; 61.4 dB on a held-out set of clips the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `inference/inference_basicvsrpp.py` | inference() / main() | 1.705x |
+| `inference/inference_basicvsrpp.py` | inference() | 1.321x |
+| `inference/inference_basicvsrpp.py` | inference() | 1.296x |
+| `inference/inference_basicvsrpp.py` | main() | 1.09x |
+| `basicsr/archs/arch_util.py` | flow_warp() | 1.081x |
+| `inference/inference_basicvsrpp.py` | main() | 1.012x |
+| `basicsr/archs/basicvsrpp_arch.py` | BasicVSRPlusPlus.forward() | 0.995x (within noise) |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/BasicSR-ao.git
+cd BasicSR-ao
+# set up exactly as upstream documents (the BasicVSR++ REDS4 model at experiments/pretrained_models/BasicVSRPP_REDS4.pth,
+# the input frames at datasets/REDS4/sharp_bicubic/000), then:
+python inference/inference_basicvsrpp.py
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 8d56e3a045f9` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <p align="center">
   <img src="assets/basicsr_xpixel_logo.png" height=120>
 </p>
